@@ -67,16 +67,16 @@ def get_vq_model_class(model_type: str):
         raise ValueError(f"model_type {model_type} not supported.")
 
 
-def extract_model_components(model_bundle):
+def extract_model_components(showo_model):
     """Extract model components from bundle for convenience"""
     return (
-        model_bundle["showo_model"],
-        model_bundle["vq_model"],
-        model_bundle["tokenizer"],
-        model_bundle["uni_prompting"],
-        model_bundle["clip_vision"],
-        torch.device(model_bundle["device"]),
-        model_bundle["dtype"],
+        showo_model["showo_model"],
+        showo_model["vq_model"],
+        showo_model["tokenizer"],
+        showo_model["uni_prompting"],
+        showo_model["clip_vision"],
+        torch.device(showo_model["device"]),
+        showo_model["dtype"],
     )
 
 
@@ -101,8 +101,8 @@ class ShowoModelLoader:
             },
         }
 
-    RETURN_TYPES = ("SHOWO_MODEL_BUNDLE",)
-    RETURN_NAMES = ("model_bundle",)
+    RETURN_TYPES = ("SHOWO_MODEL",)
+    RETURN_NAMES = ("showo_model",)
     FUNCTION = "load_model"
     CATEGORY = "Show-o"
 
@@ -225,7 +225,7 @@ class ShowoTextToImage:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model_bundle": ("SHOWO_MODEL_BUNDLE",),
+                "showo_model": ("SHOWO_MODEL",),
                 "prompt": (
                     "STRING",
                     {"multiline": True, "placeholder": "Enter your prompt here..."},
@@ -275,7 +275,7 @@ class ShowoTextToImage:
 
     def generate(
         self,
-        model_bundle,
+        showo_model,
         prompt: str,
         guidance_scale: float,
         generation_timesteps: int,
@@ -286,24 +286,26 @@ class ShowoTextToImage:
         mask_schedule: str = "cosine",
     ):
         """Generate images from text prompt"""
-        # Extract components from bundle
+
+        # Extract components from pipeline
         (
-            showo_model,
+            showo_model_components,
             vq_model,
             tokenizer,
             uni_prompting,
             clip_vision,
             device_obj,
             dtype,
-        ) = extract_model_components(model_bundle)
+        ) = extract_model_components(showo_model)
 
         # Set seed if provided
         if seed != -1:
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
+                torch.cuda.manual_seed_all(seed)
 
-        mask_token_id = showo_model.config.mask_token_id
+        mask_token_id = showo_model_components.config.mask_token_id
 
         try:
             # Prepare prompts
@@ -383,8 +385,6 @@ class ShowoImageCaptioning:
         return {
             "required": {
                 "showo_model": ("SHOWO_MODEL",),
-                "vq_model": ("VQ_MODEL",),
-                "uni_prompting": ("UNI_PROMPTING",),
                 "image": ("IMAGE",),
             },
             "optional": {
@@ -423,17 +423,22 @@ class ShowoImageCaptioning:
     def caption_image(
         self,
         showo_model,
-        vq_model,
-        uni_prompting,
         image,
         question: str = "",
         max_new_tokens: int = 128,
         temperature: float = 0.8,
         top_k: int = 1,
     ):
-        """Generate caption or answer question about image"""
-
-        device = next(showo_model.parameters()).device
+        """Generate caption or answer question about image"""  # Extract components from bundle
+        (
+            showo_model_components,
+            vq_model,
+            tokenizer,
+            uni_prompting,
+            clip_vision,
+            device_obj,
+            dtype,
+        ) = extract_model_components(showo_model)
 
         try:
             # Convert ComfyUI image format [B, H, W, C] to [B, C, H, W]
@@ -445,11 +450,9 @@ class ShowoImageCaptioning:
             # Convert to PIL for processing
             image_pil = Image.fromarray(
                 (image_tensor.cpu().numpy() * 255).astype(np.uint8)
-            )
-
-            # Transform image to model format
+            )  # Transform image to model format
             image_transformed = (
-                image_transform(image_pil, resolution=256).to(device).unsqueeze(0)
+                image_transform(image_pil, resolution=256).to(device_obj).unsqueeze(0)
             )
 
             # VQ encode image
@@ -465,27 +468,27 @@ class ShowoImageCaptioning:
             input_ids = uni_prompting.text_tokenizer(
                 ["USER: \n" + question + " ASSISTANT:"]
             )["input_ids"]
-            input_ids = torch.tensor(input_ids).to(device)
+            input_ids = torch.tensor(input_ids).to(device_obj)
 
             input_ids = torch.cat(
                 [
                     (
                         torch.ones(input_ids.shape[0], 1)
                         * uni_prompting.sptids_dict["<|mmu|>"]
-                    ).to(device),
+                    ).to(device_obj),
                     (
                         torch.ones(input_ids.shape[0], 1)
                         * uni_prompting.sptids_dict["<|soi|>"]
-                    ).to(device),
+                    ).to(device_obj),
                     image_tokens,
                     (
                         torch.ones(input_ids.shape[0], 1)
                         * uni_prompting.sptids_dict["<|eoi|>"]
-                    ).to(device),
+                    ).to(device_obj),
                     (
                         torch.ones(input_ids.shape[0], 1)
                         * uni_prompting.sptids_dict["<|sot|>"]
-                    ).to(device),
+                    ).to(device_obj),
                     input_ids,
                 ],
                 dim=1,
@@ -493,7 +496,8 @@ class ShowoImageCaptioning:
 
             # Create attention mask
             attention_mask = create_attention_mask_for_mmu(
-                input_ids.to(device), eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"])
+                input_ids.to(device_obj),
+                eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
             )
 
             # Generate response
@@ -528,8 +532,6 @@ class ShowoImageInpainting:
         return {
             "required": {
                 "showo_model": ("SHOWO_MODEL",),
-                "vq_model": ("VQ_MODEL",),
-                "uni_prompting": ("UNI_PROMPTING",),
                 "image": ("IMAGE",),
                 "mask": ("MASK",),
                 "prompt": (
@@ -575,8 +577,6 @@ class ShowoImageInpainting:
     def inpaint(
         self,
         showo_model,
-        vq_model,
-        uni_prompting,
         image,
         mask,
         prompt: str,
@@ -587,14 +587,25 @@ class ShowoImageInpainting:
     ):
         """Inpaint image using mask and prompt"""
 
+        # Extract components from bundle
+        (
+            showo_model_components,
+            vq_model,
+            tokenizer,
+            uni_prompting,
+            clip_vision,
+            device_obj,
+            dtype,
+        ) = extract_model_components(showo_model)
+
         # Set seed if provided
         if seed != -1:
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
 
-        device = next(showo_model.parameters()).device
-        mask_token_id = showo_model.config.mask_token_id
+        device = device_obj
+        mask_token_id = showo_model_components.config.mask_token_id
 
         try:
             # Convert ComfyUI formats
@@ -660,11 +671,9 @@ class ShowoImageInpainting:
                 uncond_input_ids = None
 
             # Get mask schedule
-            mask_schedule_fn = get_mask_chedule("cosine")
-
-            # Generate inpainted content
+            mask_schedule_fn = get_mask_chedule("cosine")  # Generate inpainted content
             with torch.no_grad():
-                gen_token_ids = showo_model.t2i_generate(
+                gen_token_ids = showo_model_components.t2i_generate(
                     input_ids=input_ids,
                     uncond_input_ids=uncond_input_ids,
                     attention_mask=attention_mask,
