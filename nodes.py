@@ -368,18 +368,22 @@ class ShowoTextToImage:
             device_obj,
             dtype,
         ) = extract_model_components(showo_model)
-        # Load configuration for ComfyUI following inference_t2i.py approach
         config = get_config_for_comfyui(
             batch_size=batch_size,
             guidance_scale=guidance_scale,
             generation_timesteps=generation_timesteps,
             mode="t2i",
         )
-
-        # Modify configuration to match input parameters
         config.training.batch_size = batch_size
         config.training.guidance_scale = guidance_scale
         config.training.generation_timesteps = generation_timesteps
+        config.dataset.params.resolution = resolution  # Set generation resolution
+
+        # Calculate VQ token count based on resolution
+        # Show-o uses 16x downsampling, so token count = (resolution/16)^2
+        vq_resolution = resolution // 16
+        num_vq_tokens = vq_resolution * vq_resolution
+        config.model.showo.num_vq_tokens = num_vq_tokens
 
         # Set seed if provided
         if seed != -1:
@@ -391,12 +395,16 @@ class ShowoTextToImage:
         mask_token_id = showo_model_components.config.mask_token_id
 
         try:
-            # Prepare prompts
-            prompts = [
-                prompt.strip()
-            ] * batch_size  # Initialize image tokens as mask tokens
+            # Calculate correct token count based on resolution
+            vq_resolution = resolution // 16
+            num_vq_tokens = vq_resolution * vq_resolution  # Prepare prompts
+            prompts = [prompt.strip()] * batch_size
+
+            # Initialize image tokens as mask tokens
             image_tokens = (
-                torch.ones((batch_size, 256), dtype=torch.long, device=device_obj)
+                torch.ones(
+                    (batch_size, num_vq_tokens), dtype=torch.long, device=device_obj
+                )
                 * mask_token_id
             )
 
@@ -432,14 +440,11 @@ class ShowoTextToImage:
                     soi_id=int(uni_prompting.sptids_dict["<|soi|>"]),
                     eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
                     rm_pad_in_image=True,
-                )
-                # Ensure attention mask is on correct device and dtype
+                )  # Ensure attention mask is on correct device and dtype
                 attention_mask = attention_mask.to(device_obj)
                 if dtype == torch.float16 or dtype == torch.bfloat16:
                     attention_mask = attention_mask.to(dtype)
-                uncond_input_ids = (
-                    None  # Get mask schedule - 严格遵循 inference_t2i.py 的方式
-                )
+                uncond_input_ids = None
             if config.get("mask_schedule", None) is not None:
                 schedule = config.mask_schedule.schedule
                 args = config.mask_schedule.get("params", {})
@@ -449,7 +454,7 @@ class ShowoTextToImage:
                     config.training.get("mask_schedule", "cosine")
                 )
 
-            # Generate tokens - 严格遵循 inference_t2i.py 的调用方式
+            # Generate tokens
             with torch.no_grad():
                 gen_token_ids = showo_model_components.t2i_generate(
                     input_ids=input_ids,
@@ -462,14 +467,17 @@ class ShowoTextToImage:
                     noise_type=config.training.get("noise_type", "mask"),
                     seq_len=config.model.showo.num_vq_tokens,
                     uni_prompting=uni_prompting,
-                    config=config,  # 传入完整的 config，而不是 model.config
+                    config=config,
                 )
-
-            # Decode images - 使用 config 中的参数
             gen_token_ids = torch.clamp(
                 gen_token_ids, max=config.model.showo.codebook_size - 1, min=0
             )
-            images = vq_model.decode_code(gen_token_ids)
+
+            # VQ decoding
+            vq_resolution = resolution // 16
+            images = vq_model.decode_code(
+                gen_token_ids, shape=(vq_resolution, vq_resolution)
+            )
 
             # Convert to ComfyUI format [B, H, W, C] and normalize to [0, 1]
             images = torch.clamp((images + 1.0) / 2.0, min=0.0, max=1.0)
@@ -654,6 +662,7 @@ class ShowoImageInpainting:
                     "INT",
                     {"default": 20, "min": 1, "max": 100, "step": 1},
                 ),
+                "resolution": ([256, 512], {"default": 256}),
             },
             "optional": {
                 "seed": ("INT", {"default": -1, "min": -1, "max": 0xFFFFFFFFFFFFFFFF}),
@@ -687,6 +696,7 @@ class ShowoImageInpainting:
         prompt: str,
         guidance_scale: float,
         generation_timesteps: int,
+        resolution: int,
         seed: int = -1,
         temperature: float = 1.0,
     ):
@@ -702,8 +712,6 @@ class ShowoImageInpainting:
             device_obj,
             dtype,
         ) = extract_model_components(showo_model)
-
-        # Load configuration for ComfyUI following inference_t2i.py approach
         config = get_config_for_comfyui(
             # Override configuration parameters, simulating command line arguments
             batch_size=1,  # inpainting usually processes single image
@@ -711,11 +719,15 @@ class ShowoImageInpainting:
             generation_timesteps=generation_timesteps,
             mode="inpainting",
         )
-
-        # Modify configuration to match input parameters
         config.training.batch_size = 1
         config.training.guidance_scale = guidance_scale
         config.training.generation_timesteps = generation_timesteps
+        config.dataset.params.resolution = resolution  # Set generation resolution
+
+        # Calculate VQ token count based on resolution
+        vq_resolution = resolution // 16
+        num_vq_tokens = vq_resolution * vq_resolution
+        config.model.showo.num_vq_tokens = num_vq_tokens
 
         # Set seed if provided
         if seed != -1:
@@ -729,27 +741,26 @@ class ShowoImageInpainting:
         try:
             # Convert ComfyUI formats
             if len(image.shape) == 4:
-                image_tensor = image[0]  # Take first image if batch
-            else:
+                image_tensor = image[0]  # Take first image if batch            else:
                 image_tensor = image
-
-            # Convert to PIL and transform
             image_pil = Image.fromarray(
                 (image_tensor.cpu().numpy() * 255).astype(np.uint8)
             )
             inpainting_image = (
-                image_transform(image_pil, resolution=256).to(device).unsqueeze(0)
+                image_transform(image_pil, resolution=resolution)
+                .to(device)
+                .unsqueeze(0)
             )
 
             # Process mask
             if len(mask.shape) == 3:
-                mask_tensor = mask.unsqueeze(0)  # Add batch dimension
-            else:
+                mask_tensor = mask.unsqueeze(0)  # Add batch dimension            else:
                 mask_tensor = mask
 
-            # Resize mask to VQ resolution (16x16)
+            # Resize mask to VQ resolution
+            vq_resolution = resolution // 16
             inpainting_mask = F.interpolate(
-                mask_tensor.unsqueeze(1), size=16, mode="bicubic"
+                mask_tensor.unsqueeze(1), size=vq_resolution, mode="bicubic"
             ).squeeze(1)
             inpainting_mask[inpainting_mask < 0.5] = 0
             inpainting_mask[inpainting_mask >= 0.5] = 1
@@ -796,14 +807,11 @@ class ShowoImageInpainting:
                     soi_id=int(uni_prompting.sptids_dict["<|soi|>"]),
                     eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
                     rm_pad_in_image=True,
-                )
-                # Ensure attention mask is on correct device and dtype
+                )  # Ensure attention mask is on correct device and dtype
                 attention_mask = attention_mask.to(device_obj)
                 if dtype == torch.float16 or dtype == torch.bfloat16:
                     attention_mask = attention_mask.to(dtype)
-                uncond_input_ids = (
-                    None  # Get mask schedule - 严格遵循 inference_t2i.py 的方式
-                )
+                uncond_input_ids = None
             if config.get("mask_schedule", None) is not None:
                 schedule = config.mask_schedule.schedule
                 args = config.mask_schedule.get("params", {})
@@ -813,7 +821,7 @@ class ShowoImageInpainting:
                     config.training.get("mask_schedule", "cosine")
                 )
 
-            # Generate inpainted content - 严格遵循 inference_t2i.py 的调用方式
+            # Generate inpainted content
             with torch.no_grad():
                 gen_token_ids = showo_model_components.t2i_generate(
                     input_ids=input_ids,
@@ -826,14 +834,15 @@ class ShowoImageInpainting:
                     noise_type=config.training.get("noise_type", "mask"),
                     seq_len=config.model.showo.num_vq_tokens,
                     uni_prompting=uni_prompting,
-                    config=config,  # 传入完整的 config，而不是 model.config
+                    config=config,
                 )
-
-            # Decode image - 使用 config 中的参数
             gen_token_ids = torch.clamp(
                 gen_token_ids, max=config.model.showo.codebook_size - 1, min=0
             )
-            images = vq_model.decode_code(gen_token_ids)
+            vq_resolution = resolution // 16
+            images = vq_model.decode_code(
+                gen_token_ids, shape=(vq_resolution, vq_resolution)
+            )
 
             # Convert to ComfyUI format
             images = torch.clamp((images + 1.0) / 2.0, min=0.0, max=1.0)
