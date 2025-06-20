@@ -6,12 +6,6 @@ from PIL import Image
 import numpy as np
 from typing import Tuple, Optional, List, Dict, Any
 
-# Add Show-o to path
-current_dir = os.path.dirname(os.path.abspath(__file__))
-showo_path = os.path.join(current_dir, "Show-o")
-if showo_path not in sys.path:
-    sys.path.append(showo_path)
-
 # ComfyUI models directory
 try:
     from folder_paths import folder_names_and_paths, models_dir as comfy_models_dir
@@ -36,20 +30,39 @@ os.makedirs(showo_cache_dir, exist_ok=True)
 os.environ["TRANSFORMERS_CACHE"] = os.path.join(showo_cache_dir, "transformers")
 os.environ["HF_HOME"] = os.path.join(showo_cache_dir, "huggingface")
 
+# Import transformers modules (required)
 try:
-    from models import Showo, MAGVITv2, CLIPVisionTower, get_mask_chedule
-    from training.prompting_utils import (
-        UniversalPrompting,
-        create_attention_mask_predict_next,
-        create_attention_mask_for_mmu,
-        create_attention_mask_for_mmu_vit,
-    )
-    from training.utils import image_transform
     from transformers import AutoTokenizer, CLIPImageProcessor
-    from llava.llava import conversation as conversation_lib
 except ImportError as e:
-    print(f"Error importing Show-o modules: {e}")
-    print("Please ensure Show-o code is properly installed in the Show-o/ directory")
+    raise ImportError(
+        f"transformers library is required but not installed: {e}. Please install it with: pip install transformers"
+    )
+
+# Import models
+from .models import Showo, MAGVITv2, CLIPVisionTower, get_mask_chedule
+
+# Import training modules
+from .training.prompting_utils import (
+    UniversalPrompting,
+    create_attention_mask_predict_next,
+    create_attention_mask_for_mmu,
+    create_attention_mask_for_mmu_vit,
+)
+from .training.utils import image_transform, get_config
+
+# Import omegaconf for config handling
+try:
+    from omegaconf import OmegaConf
+except ImportError as e:
+    raise ImportError(
+        f"omegaconf library is required but not installed: {e}. Please install it with: pip install omegaconf"
+    )
+
+# Import llava
+from .llava.llava import conversation as conversation_lib
+
+# Set flag to indicate modules are available
+SHOWO_MODULES_AVAILABLE = True
 
 # Global constants
 SYSTEM_PROMPT = (
@@ -59,8 +72,36 @@ SYSTEM_PROMPT = (
 SYSTEM_PROMPT_LEN = 28
 
 
+def get_config_for_comfyui(config_path=None, **cli_overrides):
+    """
+    Simulate the behavior of get_config() function for ComfyUI environment
+    Reference: get_config() implementation in training/utils.py
+    """
+    # Use default demo config if no config file path is specified
+    if config_path is None:
+        config_path = os.path.join(
+            os.path.dirname(__file__), "configs", "showo_demo.yaml"
+        )
+
+    # Simulate cli_conf = OmegaConf.from_cli()
+    # In ComfyUI environment, manually create cli_conf with config path and other override parameters
+    cli_conf = OmegaConf.create({"config": config_path, **cli_overrides})
+
+    # Load YAML configuration
+    yaml_conf = OmegaConf.load(cli_conf.config)
+
+    # Merge configurations
+    conf = OmegaConf.merge(yaml_conf, cli_conf)
+
+    return conf
+
+
 def get_vq_model_class(model_type: str):
     """Get VQ model class by type"""
+    if not SHOWO_MODULES_AVAILABLE:
+        raise ImportError(
+            "Show-o modules are not available. Please check installation."
+        )
     if model_type == "magvitv2":
         return MAGVITv2
     else:
@@ -142,9 +183,7 @@ class ShowoModelLoader:
 
         try:
             # Set cache directory for this specific load - all under show_o folder
-            cache_dir = os.path.join(
-                comfy_models_dir, "show_o", "models", model_version
-            )
+            cache_dir = os.path.join(comfy_models_dir, "show_o", model_version)
             os.makedirs(cache_dir, exist_ok=True)
 
             # Load tokenizer with custom cache directory
@@ -181,16 +220,48 @@ class ShowoModelLoader:
             vq_model.eval()
 
             if precision != "fp32" and device == "cuda":
-                vq_model = vq_model.to(dtype)
+                vq_model = vq_model.to(
+                    dtype
+                )  # Load Show-o main model with custom cache directory
+            # Use torch_dtype to avoid meta tensor issues
+            print(f"Loading Show-o model from {model_path}...")
+            model_kwargs = {
+                "cache_dir": cache_dir,
+                "torch_dtype": dtype if device == "cuda" else torch.float32,
+                "device_map": None,  # Don't use device_map to avoid meta tensors
+                "low_cpu_mem_usage": False,  # Disable to avoid meta tensors
+            }
 
-            # Load Show-o main model with custom cache directory
-            showo_model = Showo.from_pretrained(model_path, cache_dir=cache_dir).to(
-                device_obj
-            )
+            try:
+                showo_model = Showo.from_pretrained(model_path, **model_kwargs)
+                print("✅ Show-o model loaded successfully")
+            except Exception as model_load_error:
+                print(
+                    f"⚠️ Failed to load with torch_dtype, trying without: {model_load_error}"
+                )
+                # Fallback: load without torch_dtype
+                model_kwargs.pop("torch_dtype", None)
+                showo_model = Showo.from_pretrained(model_path, **model_kwargs)
+                print("✅ Show-o model loaded with fallback method")
+
+            showo_model = showo_model.to(device_obj)
             showo_model.eval()
 
+            # Ensure model precision is consistent - this is crucial for attention mechanisms
             if precision != "fp32" and device == "cuda":
+                # Convert the entire model to the specified dtype
                 showo_model = showo_model.to(dtype)
+                # Also ensure all parameters and buffers are in the correct dtype
+                for param in showo_model.parameters():
+                    if (
+                        param.dtype != torch.long and param.dtype != torch.int
+                    ):  # Don't convert integer tensors
+                        param.data = param.data.to(dtype)
+                for buffer in showo_model.buffers():
+                    if (
+                        buffer.dtype != torch.long and buffer.dtype != torch.int
+                    ):  # Don't convert integer tensors
+                        buffer.data = buffer.data.to(dtype)
 
             # Create model bundle
             model_bundle = {
@@ -297,6 +368,18 @@ class ShowoTextToImage:
             device_obj,
             dtype,
         ) = extract_model_components(showo_model)
+        # Load configuration for ComfyUI following inference_t2i.py approach
+        config = get_config_for_comfyui(
+            batch_size=batch_size,
+            guidance_scale=guidance_scale,
+            generation_timesteps=generation_timesteps,
+            mode="t2i",
+        )
+
+        # Modify configuration to match input parameters
+        config.training.batch_size = batch_size
+        config.training.guidance_scale = guidance_scale
+        config.training.generation_timesteps = generation_timesteps
 
         # Set seed if provided
         if seed != -1:
@@ -320,11 +403,17 @@ class ShowoTextToImage:
             # Build input sequence
             input_ids, _ = uni_prompting((prompts, image_tokens), "t2i_gen")
 
+            # Ensure input_ids are on the correct device and dtype (long for token IDs)
+            input_ids = input_ids.to(device_obj, dtype=torch.long)
+
             # Build attention mask
             if guidance_scale > 0:
                 uncond_input_ids, _ = uni_prompting(
                     ([""] * len(prompts), image_tokens), "t2i_gen"
                 )
+                # Ensure uncond_input_ids are on the correct device
+                uncond_input_ids = uncond_input_ids.to(device_obj, dtype=torch.long)
+
                 attention_mask = create_attention_mask_predict_next(
                     torch.cat([input_ids, uncond_input_ids], dim=0),
                     pad_id=int(uni_prompting.sptids_dict["<|pad|>"]),
@@ -332,6 +421,10 @@ class ShowoTextToImage:
                     eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
                     rm_pad_in_image=True,
                 )
+                # Ensure attention mask is on correct device and dtype (bool or float depending on model)
+                attention_mask = attention_mask.to(device_obj)
+                if dtype == torch.float16 or dtype == torch.bfloat16:
+                    attention_mask = attention_mask.to(dtype)
             else:
                 attention_mask = create_attention_mask_predict_next(
                     input_ids,
@@ -340,29 +433,42 @@ class ShowoTextToImage:
                     eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
                     rm_pad_in_image=True,
                 )
-                uncond_input_ids = None
+                # Ensure attention mask is on correct device and dtype
+                attention_mask = attention_mask.to(device_obj)
+                if dtype == torch.float16 or dtype == torch.bfloat16:
+                    attention_mask = attention_mask.to(dtype)
+                uncond_input_ids = (
+                    None  # Get mask schedule - 严格遵循 inference_t2i.py 的方式
+                )
+            if config.get("mask_schedule", None) is not None:
+                schedule = config.mask_schedule.schedule
+                args = config.mask_schedule.get("params", {})
+                mask_schedule_fn = get_mask_chedule(schedule, **args)
+            else:
+                mask_schedule_fn = get_mask_chedule(
+                    config.training.get("mask_schedule", "cosine")
+                )
 
-            # Get mask schedule
-            mask_schedule_fn = get_mask_chedule(mask_schedule)
-
-            # Generate tokens
+            # Generate tokens - 严格遵循 inference_t2i.py 的调用方式
             with torch.no_grad():
-                gen_token_ids = showo_model.t2i_generate(
+                gen_token_ids = showo_model_components.t2i_generate(
                     input_ids=input_ids,
                     uncond_input_ids=uncond_input_ids,
                     attention_mask=attention_mask,
-                    guidance_scale=guidance_scale,
-                    temperature=temperature,
-                    timesteps=generation_timesteps,
+                    guidance_scale=config.training.guidance_scale,
+                    temperature=config.training.get("generation_temperature", 1.0),
+                    timesteps=config.training.generation_timesteps,
                     noise_schedule=mask_schedule_fn,
-                    noise_type="mask",
-                    seq_len=256,
+                    noise_type=config.training.get("noise_type", "mask"),
+                    seq_len=config.model.showo.num_vq_tokens,
                     uni_prompting=uni_prompting,
-                    config=None,
+                    config=config,  # 传入完整的 config，而不是 model.config
                 )
 
-            # Decode images
-            gen_token_ids = torch.clamp(gen_token_ids, max=8191, min=0)
+            # Decode images - 使用 config 中的参数
+            gen_token_ids = torch.clamp(
+                gen_token_ids, max=config.model.showo.codebook_size - 1, min=0
+            )
             images = vq_model.decode_code(gen_token_ids)
 
             # Convert to ComfyUI format [B, H, W, C] and normalize to [0, 1]
@@ -499,10 +605,9 @@ class ShowoImageCaptioning:
                 input_ids.to(device_obj),
                 eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
             )
-
             # Generate response
             with torch.no_grad():
-                cont_toks_list = showo_model.mmu_generate(
+                cont_toks_list = showo_model_components.mmu_generate(
                     input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=max_new_tokens,
@@ -598,6 +703,20 @@ class ShowoImageInpainting:
             dtype,
         ) = extract_model_components(showo_model)
 
+        # Load configuration for ComfyUI following inference_t2i.py approach
+        config = get_config_for_comfyui(
+            # Override configuration parameters, simulating command line arguments
+            batch_size=1,  # inpainting usually processes single image
+            guidance_scale=guidance_scale,
+            generation_timesteps=generation_timesteps,
+            mode="inpainting",
+        )
+
+        # Modify configuration to match input parameters
+        config.training.batch_size = 1
+        config.training.guidance_scale = guidance_scale
+        config.training.generation_timesteps = generation_timesteps
+
         # Set seed if provided
         if seed != -1:
             torch.manual_seed(seed)
@@ -642,17 +761,23 @@ class ShowoImageInpainting:
             )
 
             # Apply mask to tokens
-            inpainting_image_tokens[inpainting_mask] = mask_token_id
-
-            # Build input sequence
+            inpainting_image_tokens[inpainting_mask] = (
+                mask_token_id  # Build input sequence
+            )
             prompts = [prompt.strip()]
             input_ids, _ = uni_prompting((prompts, inpainting_image_tokens), "t2i_gen")
+
+            # Ensure input_ids are on the correct device and dtype
+            input_ids = input_ids.to(device_obj, dtype=torch.long)
 
             # Build attention mask
             if guidance_scale > 0:
                 uncond_input_ids, _ = uni_prompting(
                     ([""], inpainting_image_tokens), "t2i_gen"
                 )
+                # Ensure uncond_input_ids are on the correct device
+                uncond_input_ids = uncond_input_ids.to(device_obj, dtype=torch.long)
+
                 attention_mask = create_attention_mask_predict_next(
                     torch.cat([input_ids, uncond_input_ids], dim=0),
                     pad_id=int(uni_prompting.sptids_dict["<|pad|>"]),
@@ -660,6 +785,10 @@ class ShowoImageInpainting:
                     eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
                     rm_pad_in_image=True,
                 )
+                # Ensure attention mask is on correct device and dtype
+                attention_mask = attention_mask.to(device_obj)
+                if dtype == torch.float16 or dtype == torch.bfloat16:
+                    attention_mask = attention_mask.to(dtype)
             else:
                 attention_mask = create_attention_mask_predict_next(
                     input_ids,
@@ -668,27 +797,42 @@ class ShowoImageInpainting:
                     eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
                     rm_pad_in_image=True,
                 )
-                uncond_input_ids = None
+                # Ensure attention mask is on correct device and dtype
+                attention_mask = attention_mask.to(device_obj)
+                if dtype == torch.float16 or dtype == torch.bfloat16:
+                    attention_mask = attention_mask.to(dtype)
+                uncond_input_ids = (
+                    None  # Get mask schedule - 严格遵循 inference_t2i.py 的方式
+                )
+            if config.get("mask_schedule", None) is not None:
+                schedule = config.mask_schedule.schedule
+                args = config.mask_schedule.get("params", {})
+                mask_schedule_fn = get_mask_chedule(schedule, **args)
+            else:
+                mask_schedule_fn = get_mask_chedule(
+                    config.training.get("mask_schedule", "cosine")
+                )
 
-            # Get mask schedule
-            mask_schedule_fn = get_mask_chedule("cosine")  # Generate inpainted content
+            # Generate inpainted content - 严格遵循 inference_t2i.py 的调用方式
             with torch.no_grad():
                 gen_token_ids = showo_model_components.t2i_generate(
                     input_ids=input_ids,
                     uncond_input_ids=uncond_input_ids,
                     attention_mask=attention_mask,
-                    guidance_scale=guidance_scale,
-                    temperature=temperature,
-                    timesteps=generation_timesteps,
+                    guidance_scale=config.training.guidance_scale,
+                    temperature=config.training.get("generation_temperature", 1.0),
+                    timesteps=config.training.generation_timesteps,
                     noise_schedule=mask_schedule_fn,
-                    noise_type="mask",
-                    seq_len=256,
+                    noise_type=config.training.get("noise_type", "mask"),
+                    seq_len=config.model.showo.num_vq_tokens,
                     uni_prompting=uni_prompting,
-                    config=None,
+                    config=config,  # 传入完整的 config，而不是 model.config
                 )
 
-            # Decode image
-            gen_token_ids = torch.clamp(gen_token_ids, max=8191, min=0)
+            # Decode image - 使用 config 中的参数
+            gen_token_ids = torch.clamp(
+                gen_token_ids, max=config.model.showo.codebook_size - 1, min=0
+            )
             images = vq_model.decode_code(gen_token_ids)
 
             # Convert to ComfyUI format
