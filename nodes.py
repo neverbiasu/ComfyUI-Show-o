@@ -6,6 +6,7 @@ from PIL import Image
 import numpy as np
 from typing import Tuple, Optional, List, Dict, Any
 from omegaconf import OmegaConf
+from torchvision import transforms  # 添加对 transforms 的导入
 
 # ComfyUI models directory
 try:
@@ -74,12 +75,18 @@ SYSTEM_PROMPT_LEN = 28
 
 
 # Model configuration mapping
+# Each model version can have different config files for different tasks
 MODEL_CONFIGS = {
     "show-o": {
         "model_path": "showlab/show-o",
         "vq_model_path": "showlab/magvitv2",
         "llm_model_path": "microsoft/phi-1_5",
-        "config_path": "showo_demo.yaml",
+        "configs": {
+            "t2i": "showo_demo.yaml",
+            "inpainting": "showo_demo.yaml",
+            "mmu": "showo_demo.yaml",
+            "default": "showo_demo.yaml",
+        },
         "supported_resolutions": [256],  # Only 256x256 for Show-o
         "default_resolution": 256,
         "vq_downsample_ratio": 16,  # 16x downsampling
@@ -88,7 +95,12 @@ MODEL_CONFIGS = {
         "model_path": "showlab/show-o-2",
         "vq_model_path": "showlab/magvitv2",
         "llm_model_path": "microsoft/phi-1_5",
-        "config_path": "showo_demo_512x512.yaml",
+        "configs": {
+            "t2i": "showo_demo_512x512.yaml",
+            "inpainting": "showo_demo_512x512.yaml",
+            "mmu": "showo_demo_512x512.yaml",
+            "default": "showo_demo_512x512.yaml",
+        },
         "supported_resolutions": [256, 512],  # Both 256x256 and 512x512 for Show-o2
         "default_resolution": 512,
         "vq_downsample_ratio": 16,  # 16x downsampling
@@ -105,12 +117,17 @@ def get_model_config(model_version: str) -> Dict[str, Any]:
     return MODEL_CONFIGS[model_version].copy()
 
 
-def load_showo_config(model_version: str, **overrides) -> OmegaConf:
-    """Load Show-o configuration for the specified model version"""
+def load_showo_config(
+    model_version: str, task_type: str = "default", **overrides
+) -> OmegaConf:
+    """Load Show-o configuration for the specified model version and task type"""
     model_config = get_model_config(model_version)
-    config_path = os.path.join(
-        os.path.dirname(__file__), "configs", model_config["config_path"]
+
+    # Select appropriate config file based on task type
+    config_name = model_config["configs"].get(
+        task_type, model_config["configs"]["default"]
     )
+    config_path = os.path.join(os.path.dirname(__file__), "configs", config_name)
 
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -184,6 +201,22 @@ def get_vq_model_class(model_type: str):
         raise ValueError(f"model_type {model_type} not supported.")
 
 
+def load_task_config(model_version: str, task_type: str) -> OmegaConf:
+    """Load task-specific configuration for inference"""
+    config = load_showo_config(model_version, task_type=task_type)
+
+    # Log which config is being used
+    model_config = get_model_config(model_version)
+    config_name = model_config["configs"].get(
+        task_type, model_config["configs"]["default"]
+    )
+    print(
+        f"✅ Using config '{config_name}' for task '{task_type}' with model '{model_version}'"
+    )
+
+    return config
+
+
 def extract_model_components(showo_model):
     """Extract model components from bundle for convenience"""
     return (
@@ -253,10 +286,10 @@ class ShowoModelLoader:
         try:
             # Set cache directory for this specific load - all under show_o folder
             cache_dir = os.path.join(comfy_models_dir, "show_o", model_version)
-            os.makedirs(cache_dir, exist_ok=True)
-
-            # Load configuration first
-            config = load_showo_config(model_version)
+            os.makedirs(
+                cache_dir, exist_ok=True
+            )  # Load configuration first - using default config for model loading
+            config = load_showo_config(model_version, task_type="default")
             print(f"✅ Loaded configuration for {model_version}")
 
             # Load tokenizer with custom cache directory
@@ -418,23 +451,30 @@ class ShowoTextToImage:
 
     @classmethod
     def VALIDATE_INPUTS(cls, showo_model, prompt, resolution, **kwargs):
-        # 基本的prompt检查（允许使用默认值）
-        if prompt is not None and len(str(prompt).strip()) == 0:
-            return "Prompt cannot be empty. Please provide a text description."
+        errors = {}
 
-        # 模型感知的分辨率验证
+        if prompt is not None and len(str(prompt).strip()) == 0:
+            errors["prompt"] = (
+                "Prompt cannot be empty. Please provide a text description."
+            )
+
+        # Model-aware resolution validation
         try:
             if showo_model and isinstance(showo_model, dict):
                 model_version = showo_model.get("version", "show-o")
                 supported_resolutions = get_supported_resolutions(model_version)
                 if resolution not in supported_resolutions:
-                    return f"Resolution {resolution} not supported for {model_version}. Supported: {supported_resolutions}"
+                    errors["resolution"] = (
+                        f"Resolution {resolution} not supported for {model_version}. Supported: {supported_resolutions}"
+                    )
         except (KeyError, TypeError, ValueError):
-            # 如果模型包格式错误或缺失，使用基本验证
+            # If model bundle is malformed or missing, use basic validation
             if resolution not in [256, 512]:
-                return f"Resolution {resolution} not supported. Use 256 or 512."
+                errors["resolution"] = (
+                    f"Resolution {resolution} not supported. Use 256 or 512."
+                )
 
-        return True
+        return errors if errors else True
 
     def generate(
         self,
@@ -448,9 +488,7 @@ class ShowoTextToImage:
         temperature: float = 1.0,
         mask_schedule: str = "cosine",
     ):
-        """Generate images from text prompt using pre-loaded configuration"""
-
-        # Extract components from pipeline - now includes config
+        """Generate images from text prompt using pre-loaded configuration"""  # Extract components from pipeline - now includes config
         (
             showo_model_components,
             vq_model,
@@ -459,12 +497,15 @@ class ShowoTextToImage:
             clip_vision,
             device_obj,
             dtype,
-            config,
+            base_config,
             model_config,
         ) = extract_model_components(showo_model)
 
-        # Validate resolution against model capabilities
+        # Load task-specific configuration for text-to-image generation
         model_version = showo_model["version"]
+        task_config = load_task_config(model_version, "t2i")
+
+        # Validate resolution against model capabilities
         if resolution not in model_config["supported_resolutions"]:
             raise ValueError(
                 f"Resolution {resolution} not supported for {model_version}. "
@@ -474,8 +515,8 @@ class ShowoTextToImage:
         # Calculate VQ token count using model-aware logic
         num_vq_tokens = calculate_vq_tokens(model_version, resolution)
 
-        # Clone config and update generation parameters
-        runtime_config = OmegaConf.create(OmegaConf.to_yaml(config))
+        # Use task-specific config and update generation parameters
+        runtime_config = OmegaConf.create(OmegaConf.to_yaml(task_config))
         runtime_config.training.batch_size = batch_size
         runtime_config.training.guidance_scale = guidance_scale
         runtime_config.training.generation_timesteps = generation_timesteps
@@ -645,11 +686,17 @@ class ShowoImageCaptioning:
 
     @classmethod
     def VALIDATE_INPUTS(cls, image, max_new_tokens, **kwargs):
-        if image is None:
-            return "Image input is required"
+        """
+        Validate inputs for image captioning.
+        Returns field-specific errors or True if validation passes.
+        """
+        errors = {}
+
+        # Validate max_new_tokens range
         if not (1 <= max_new_tokens <= 512):
-            return "Max new tokens must be between 1 and 512"
-        return True
+            errors["max_new_tokens"] = "Max new tokens must be between 1 and 512"
+
+        return errors if errors else True
 
     def caption_image(
         self,
@@ -679,14 +726,16 @@ class ShowoImageCaptioning:
             if len(image.shape) == 4:
                 image_tensor = image[0]  # Take first image if batch
             else:
-                image_tensor = image
-
-            # Convert to PIL for processing
+                image_tensor = image  # Convert to PIL for processing
             image_pil = Image.fromarray(
                 (image_tensor.cpu().numpy() * 255).astype(np.uint8)
-            )  # Transform image to model format
+            )
+
+            # Transform image to model format with correct dtype
             image_transformed = (
-                image_transform(image_pil, resolution=256).to(device_obj).unsqueeze(0)
+                image_transform(image_pil, resolution=256)
+                .to(device_obj, dtype=dtype)
+                .unsqueeze(0)
             )
 
             # VQ encode image
@@ -771,7 +820,7 @@ class ShowoImageInpainting:
                     "STRING",
                     {
                         "multiline": True,
-                        "default": "a beautiful garden with flowers",
+                        "default": "a blue sports car with sleek curves and tinted windows, parked on a bustling city street.",
                         "placeholder": "Describe what should be in the masked area...",
                     },
                 ),
@@ -784,6 +833,10 @@ class ShowoImageInpainting:
                     {"default": 20, "min": 1, "max": 100, "step": 1},
                 ),
                 "resolution": ([256, 512], {"default": 256}),
+                "mask_threshold": (
+                    "FLOAT",
+                    {"default": 0.5, "min": 0.1, "max": 0.9, "step": 0.05},
+                ),
             },
             "optional": {
                 "seed": ("INT", {"default": -1, "min": -1, "max": 0xFFFFFFFFFFFFFFFF}),
@@ -794,21 +847,33 @@ class ShowoImageInpainting:
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("inpainted_image",)
-    FUNCTION = "inpaint"
+    RETURN_TYPES = "IMAGE"  # inpainted image and debug mask image
+    RETURN_NAMES = "images"
     CATEGORY = "Show-o"
+    FUNCTION = "inpaint"
 
     @classmethod
     def VALIDATE_INPUTS(cls, image, mask, prompt, **kwargs):
-        if image is None:
-            return "Image input is required"
-        if mask is None:
-            return "Mask input is required"
-        # 允许使用默认prompt，只在完全为空时报错
-        if prompt is not None and len(str(prompt).strip()) == 0:
-            return "Inpainting prompt cannot be empty. Please provide a description."
-        return True
+        """
+        Validate inputs for inpainting. Only return errors for truly invalid inputs.
+        ComfyUI will handle missing connections automatically.
+        """
+        errors = {}
+
+        # Only validate if inputs are provided and invalid
+        # ComfyUI handles missing connections, so we don't need to check for None
+        if isinstance(prompt, str) and len(prompt.strip()) == 0:
+            errors["prompt"] = (
+                "Inpainting prompt cannot be empty. Please provide a description of what you want to generate."
+            )
+
+        if mask is not None and isinstance(mask, torch.Tensor):
+            # Check if mask has any non-zero values
+            if mask.sum() == 0:
+                errors["mask"] = (
+                    "Mask is completely black. Please provide a mask with white areas to inpaint."  # Return errors only if we found any, otherwise validation passes
+                )
+        return errors if errors else True
 
     def inpaint(
         self,
@@ -819,12 +884,14 @@ class ShowoImageInpainting:
         guidance_scale: float,
         generation_timesteps: int,
         resolution: int,
+        mask_threshold: float = 0.5,
         seed: int = -1,
         temperature: float = 1.0,
     ):
-        """Inpaint image using mask and prompt"""
-
-        # Extract components from bundle
+        """
+        Perform inpainting using the given mask and prompt.
+        """
+        # Extract model components
         (
             showo_model_obj,
             vq_model,
@@ -833,151 +900,150 @@ class ShowoImageInpainting:
             clip_vision,
             device_obj,
             dtype,
-            config,
+            base_config,
             model_config,
         ) = extract_model_components(showo_model)
 
-        # Clone config and update inpainting parameters
-        runtime_config = OmegaConf.create(OmegaConf.to_yaml(config))
-        runtime_config.training.batch_size = 1
+        # Ensure resolution is supported by the loaded model
+        model_version = showo_model.get("version", "show-o")
+        if resolution not in model_config["supported_resolutions"]:
+            raise ValueError(
+                f"Resolution {resolution} not supported for model {model_version}. "
+                f"Please use the 'show-o-512x512' model version for 512 resolution inpainting."
+            )
+        # Load task-specific configuration for inpainting
+        task_config = load_task_config(
+            (
+                model_config["version"]
+                if "version" in model_config
+                else showo_model.get("version", "show-o")
+            ),
+            "inpainting",
+        )
+
+        # Prepare runtime config
+        runtime_config = OmegaConf.create(OmegaConf.to_yaml(task_config))
+        batch = runtime_config.training.batch_size
         runtime_config.training.guidance_scale = guidance_scale
         runtime_config.training.generation_timesteps = generation_timesteps
-        runtime_config.dataset.params.resolution = (
-            resolution  # Calculate VQ token count based on resolution
+        runtime_config.dataset.params.resolution = resolution
+        runtime_config.model.showo.num_vq_tokens = calculate_vq_tokens(
+            (
+                model_config["version"]
+                if "version" in model_config
+                else showo_model.get("version", "show-o")
+            ),
+            resolution,
         )
-        vq_resolution = resolution // 16
-        num_vq_tokens = vq_resolution * vq_resolution
-        runtime_config.model.showo.num_vq_tokens = num_vq_tokens
 
         # Set seed if provided
         if seed != -1:
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
+            np.random.seed(seed % (2**32 - 1))
 
-        device = device_obj
-        # Get mask_token_id from the loaded model config, not from YAML config
-        mask_token_id = showo_model_obj.config.mask_token_id
+        # Mask preprocessing and VQ downsampling with debug
+        mask_t = mask.unsqueeze(0) if mask.dim() == 2 else mask
+        mask_t = (mask_t > mask_threshold).float()
+        vq_res = resolution // model_config["vq_downsample_ratio"]
+        mask_t = mask_t.unsqueeze(1)
+        mask_t = F.interpolate(mask_t, size=(vq_res, vq_res), mode="nearest")
+        inpainting_mask = mask_t.squeeze(1).reshape(batch, -1).to(torch.bool)
 
-        try:
-            # Convert ComfyUI formats
-            if len(image.shape) == 4:
-                image_tensor = image[0]  # Take first image if batch
-            else:
-                image_tensor = image
-            image_pil = Image.fromarray(
+        # Image preprocessing
+        if len(image.shape) == 4:
+            image_tensor = image[0]
+        else:
+            image_tensor = image
+        inpainting_image = image_transform(
+            Image.fromarray(
                 (image_tensor.cpu().numpy() * 255).astype(np.uint8)
+            ).convert("RGB"),
+            resolution=resolution,
+        ).to(device_obj, dtype=dtype)
+        inpainting_image = inpainting_image.unsqueeze(0).repeat(batch, 1, 1, 1)
+        inpainting_mask = inpainting_mask.to(device_obj)
+
+        # Apply mask tokens
+        inpainting_image_tokens = vq_model.get_code(inpainting_image) + len(
+            uni_prompting.text_tokenizer
+        )
+        original_tokens = inpainting_image_tokens.clone()
+        mask_token_id = (
+            base_config.mask_token_id
+            if hasattr(base_config, "mask_token_id")
+            else showo_model.get("config", {}).get("mask_token_id", 0)
+        )
+        inpainting_image_tokens[inpainting_mask] = mask_token_id
+
+        # Prepare prompt
+        prompts = [prompt.strip()] * batch
+        input_ids, _ = uni_prompting((prompts, inpainting_image_tokens), "t2i_gen")
+        input_ids = input_ids.to(device_obj, dtype=torch.long)
+
+        # Prepare unconditional input for classifier-free guidance
+        guidance_scale = float(guidance_scale)
+        if guidance_scale > 0:
+            uncond_input_ids, _ = uni_prompting(
+                ([""] * batch, inpainting_image_tokens), "t2i_gen"
             )
-            inpainting_image = (
-                image_transform(image_pil, resolution=resolution)
-                .to(device)
-                .unsqueeze(0)
+            uncond_input_ids = uncond_input_ids.to(device_obj, dtype=torch.long)
+            attention_mask = create_attention_mask_predict_next(
+                torch.cat([input_ids, uncond_input_ids], dim=0),
+                pad_id=int(uni_prompting.sptids_dict["<|pad|>"]),
+                soi_id=int(uni_prompting.sptids_dict["<|soi|>"]),
+                eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
+                rm_pad_in_image=True,
             )
-
-            # Process mask
-            if len(mask.shape) == 3:
-                mask_tensor = mask.unsqueeze(0)  # Add batch dimension
-            else:
-                mask_tensor = mask
-
-            # Resize mask to VQ resolution
-            vq_resolution = resolution // 16
-            inpainting_mask = F.interpolate(
-                mask_tensor.unsqueeze(1), size=vq_resolution, mode="bicubic"
-            ).squeeze(1)
-            inpainting_mask[inpainting_mask < 0.5] = 0
-            inpainting_mask[inpainting_mask >= 0.5] = 1
-            inpainting_mask = (
-                inpainting_mask.reshape(1, -1).to(torch.bool).to(device)
-            )  # VQ encode image
-            inpainting_image_tokens = vq_model.get_code(inpainting_image) + len(
-                uni_prompting.text_tokenizer
+            attention_mask = attention_mask.to(device_obj)
+            if dtype == torch.float16 or dtype == torch.bfloat16:
+                attention_mask = attention_mask.to(dtype)
+        else:
+            attention_mask = create_attention_mask_predict_next(
+                input_ids,
+                pad_id=int(uni_prompting.sptids_dict["<|pad|>"]),
+                soi_id=int(uni_prompting.sptids_dict["<|soi|>"]),
+                eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
+                rm_pad_in_image=True,
             )
+            attention_mask = attention_mask.to(device_obj)
+            if dtype == torch.float16 or dtype == torch.bfloat16:
+                attention_mask = attention_mask.to(dtype)
+            uncond_input_ids = None
 
-            # Apply mask to tokens
-            inpainting_image_tokens[inpainting_mask] = mask_token_id
+        # Use mask schedule from config or parameter
+        if runtime_config.get("mask_schedule", None) is not None:
+            schedule = runtime_config.mask_schedule.schedule
+            args = runtime_config.mask_schedule.get("params", {})
+        else:
+            schedule = "cosine"
+            args = {}
 
-            # Build input sequence
-            prompts = [prompt.strip()]
-            input_ids, _ = uni_prompting((prompts, inpainting_image_tokens), "t2i_gen")
+        mask_schedule = get_mask_chedule(schedule, **args)
 
-            # Ensure input_ids are on the correct device and dtype
-            input_ids = input_ids.to(device_obj, dtype=torch.long)
+        # Generate with masked tokens
+        gen_token_ids = showo_model_obj.t2i_generate(
+            input_ids=input_ids,
+            uncond_input_ids=uncond_input_ids,
+            attention_mask=attention_mask,
+            guidance_scale=guidance_scale,
+            temperature=temperature,
+            timesteps=generation_timesteps,
+            noise_schedule=mask_schedule,
+            noise_type=runtime_config.training.get("noise_type", "mask"),
+            seq_len=runtime_config.model.showo.num_vq_tokens,
+            uni_prompting=uni_prompting,
+            config=runtime_config,
+        )
+        gen_token_ids = torch.clamp(
+            gen_token_ids, max=runtime_config.model.showo.codebook_size - 1, min=0
+        )
+        images = vq_model.decode_code(gen_token_ids)
+        images = torch.clamp((images + 1.0) / 2.0, min=0.0, max=1.0)
+        images = images.permute(0, 2, 3, 1).cpu().float()
 
-            # Build attention mask
-            if guidance_scale > 0:
-                uncond_input_ids, _ = uni_prompting(
-                    ([""], inpainting_image_tokens), "t2i_gen"
-                )
-                # Ensure uncond_input_ids are on the correct device
-                uncond_input_ids = uncond_input_ids.to(device_obj, dtype=torch.long)
-
-                attention_mask = create_attention_mask_predict_next(
-                    torch.cat([input_ids, uncond_input_ids], dim=0),
-                    pad_id=int(uni_prompting.sptids_dict["<|pad|>"]),
-                    soi_id=int(uni_prompting.sptids_dict["<|soi|>"]),
-                    eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
-                    rm_pad_in_image=True,
-                )
-                # Ensure attention mask is on correct device and dtype
-                attention_mask = attention_mask.to(device_obj)
-                if dtype == torch.float16 or dtype == torch.bfloat16:
-                    attention_mask = attention_mask.to(dtype)
-            else:
-                attention_mask = create_attention_mask_predict_next(
-                    input_ids,
-                    pad_id=int(uni_prompting.sptids_dict["<|pad|>"]),
-                    soi_id=int(uni_prompting.sptids_dict["<|soi|>"]),
-                    eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
-                    rm_pad_in_image=True,
-                )  # Ensure attention mask is on correct device and dtype
-                attention_mask = attention_mask.to(device_obj)
-                if dtype == torch.float16 or dtype == torch.bfloat16:
-                    attention_mask = attention_mask.to(dtype)
-                uncond_input_ids = None
-
-            if runtime_config.get("mask_schedule", None) is not None:
-                schedule = runtime_config.mask_schedule.schedule
-                args = runtime_config.mask_schedule.get("params", {})
-                mask_schedule_fn = get_mask_chedule(schedule, **args)
-            else:
-                mask_schedule_fn = get_mask_chedule(
-                    runtime_config.training.get("mask_schedule", "cosine")
-                )
-
-            # Generate inpainted content
-            with torch.no_grad():
-                gen_token_ids = showo_model_obj.t2i_generate(
-                    input_ids=input_ids,
-                    uncond_input_ids=uncond_input_ids,
-                    attention_mask=attention_mask,
-                    guidance_scale=runtime_config.training.guidance_scale,
-                    temperature=runtime_config.training.get(
-                        "generation_temperature", 1.0
-                    ),
-                    timesteps=runtime_config.training.generation_timesteps,
-                    noise_schedule=mask_schedule_fn,
-                    noise_type=runtime_config.training.get("noise_type", "mask"),
-                    seq_len=runtime_config.model.showo.num_vq_tokens,
-                    uni_prompting=uni_prompting,
-                    config=runtime_config,
-                )
-            gen_token_ids = torch.clamp(
-                gen_token_ids, max=runtime_config.model.showo.codebook_size - 1, min=0
-            )
-            vq_resolution = resolution // 16
-            images = vq_model.decode_code(
-                gen_token_ids, shape=(vq_resolution, vq_resolution)
-            )
-
-            # Convert to ComfyUI format
-            images = torch.clamp((images + 1.0) / 2.0, min=0.0, max=1.0)
-            images = images.permute(0, 2, 3, 1).cpu().float()
-
-            return (images,)
-
-        except Exception as e:
-            raise RuntimeError(f"Image inpainting failed: {str(e)}")
+        return (images,)
 
 
 # Node mappings for ComfyUI
