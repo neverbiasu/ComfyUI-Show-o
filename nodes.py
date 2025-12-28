@@ -73,6 +73,8 @@ SYSTEM_PROMPT = (
 )
 SYSTEM_PROMPT_LEN = 28
 
+CONFIG_SHOWO_DEMO = "showo_demo.yaml"
+CONFIG_SHOWO_DEMO_512 = "showo_demo_512x512.yaml"
 
 # Model configuration mapping
 # Each model version can have different config files for different tasks
@@ -82,10 +84,10 @@ MODEL_CONFIGS = {
         "vq_model_path": "showlab/magvitv2",
         "llm_model_path": "microsoft/phi-1_5",
         "configs": {
-            "t2i": "showo_demo.yaml",
-            "inpainting": "showo_demo.yaml",
-            "mmu": "showo_demo.yaml",
-            "default": "showo_demo.yaml",
+            "t2i": CONFIG_SHOWO_DEMO,
+            "inpainting": CONFIG_SHOWO_DEMO,
+            "mmu": CONFIG_SHOWO_DEMO,
+            "default": CONFIG_SHOWO_DEMO,
         },
         "supported_resolutions": [256],  # Only 256x256 for Show-o
         "default_resolution": 256,
@@ -96,10 +98,10 @@ MODEL_CONFIGS = {
         "vq_model_path": "showlab/magvitv2",
         "llm_model_path": "microsoft/phi-1_5",
         "configs": {
-            "t2i": "showo_demo_512x512.yaml",
-            "inpainting": "showo_demo_512x512.yaml",
-            "mmu": "showo_demo_512x512.yaml",
-            "default": "showo_demo_512x512.yaml",
+            "t2i": CONFIG_SHOWO_DEMO_512,
+            "inpainting": CONFIG_SHOWO_DEMO_512,
+            "mmu": CONFIG_SHOWO_DEMO_512,
+            "default": CONFIG_SHOWO_DEMO_512,
         },
         "supported_resolutions": [256, 512],  # Both 256x256 and 512x512 for Show-o2
         "default_resolution": 512,
@@ -173,7 +175,7 @@ def get_config_for_comfyui(config_path=None, **cli_overrides):
     # Use default demo config if no config file path is specified
     if config_path is None:
         config_path = os.path.join(
-            os.path.dirname(__file__), "configs", "showo_demo.yaml"
+            os.path.dirname(__file__), "configs", CONFIG_SHOWO_DEMO
         )
 
     # Simulate cli_conf = OmegaConf.from_cli()
@@ -969,7 +971,7 @@ class ShowoImageInpainting:
         inpainting_image_tokens = vq_model.get_code(inpainting_image) + len(
             uni_prompting.text_tokenizer
         )
-        original_tokens = inpainting_image_tokens.clone()
+        # original_tokens = inpainting_image_tokens.clone() # Unused
         mask_token_id = (
             base_config.mask_token_id
             if hasattr(base_config, "mask_token_id")
@@ -1061,4 +1063,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ShowoImageInpainting": "Show-o Image Inpainting",
 }
 
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "CONFIG_SHOWO_DEMO", "CONFIG_SHOWO_DEMO_512"]
